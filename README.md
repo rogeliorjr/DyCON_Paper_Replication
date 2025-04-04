@@ -23,8 +23,7 @@ This repository is based on the following packges:
 Create `conda` environment using `requirements.yml` file to fully install the packages with dependencies.
 
 ## Datasets
-BraTS-2019 can be downloaded at [Kaggle](https://www.kaggle.com/datasets/aryashah2k/brain-tumor-segmentation-brats-2019/data)
-The preprocessed PancreasCT can be found at [Drive](https://drive.google.com/drive/folders/1kQX8z34kF62ZF_1-DqFpIosB4zDThvPz?usp=sharing).
+BraTS-2019 can be downloaded at [Kaggle](https://www.kaggle.com/datasets/aryashah2k/brain-tumor-segmentation-brats-2019/data) and the preprocessed PancreasCT can be found at [Drive](https://drive.google.com/drive/folders/1kQX8z34kF62ZF_1-DqFpIosB4zDThvPz?usp=sharing).
 
 ## Usage
 To train the model `cd code/` and run the script file,
