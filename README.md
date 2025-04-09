@@ -44,7 +44,7 @@ python test_Pancreas.py --labelnum 12    # Evaluating on PancreasCT dataset
 If you find this work useful in your research, please star our repository and consider citing:
 
 ```
-@article{assefa2025dycon,
+@Proceedings{assefa2025dycon,
       title={DyCON: Dynamic Uncertainty-aware Consistency and Contrastive Learning for Semi-supervised Medical Image Segmentation},
       author={Maregu Assefa, Muzammal Naseer, Iyyakutti Iyappan Ganapathi, Syed Sadaf Ali, Mohamed L Seghier, Naoufel Werghi}, 
       booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
