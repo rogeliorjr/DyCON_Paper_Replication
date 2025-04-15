@@ -10,6 +10,20 @@ def adaptive_beta(epoch, total_epochs, max_beta=5.0, min_beta=0.5):
     exponent = epoch / total_epochs
     beta = max_beta * (ratio ** exponent)
     return beta
+    
+def gambling_softmax(logits):
+    """
+    Compute gambling softmax probabilities over the channel dimension.
+    
+    Args:
+        logits (Tensor): Input tensor of shape (B, C, ...).
+    
+    Returns:
+        Tensor: Softmax probabilities of the same shape.
+    """
+    exp_logits = torch.exp(logits)
+    denom = torch.sum(exp_logits, dim=1, keepdim=True)
+    return exp_logits / (denom + 1e-18)
 
 def sigmoid_rampup(current_epoch, total_rampup_epochs, min_threshold, max_threshold, steepness=5.0):
     """
@@ -102,41 +116,6 @@ class UnCLoss(nn.Module):
         loss = torch.mean(loss.sum(dim=1) + beta * (H_s + H_t))
 
         return loss.mean()
-
-def sigmoid_rampup(current_epoch, total_rampup_epochs, min_threshold, max_threshold, steepness=5.0):
-    """
-    Compute a dynamic threshold using a sigmoid ramp-up schedule.
-    
-    Args:
-        current_epoch (int or float): Current epoch or iteration.
-        total_rampup_epochs (int or float): Number of epochs/iterations over which to ramp up.
-        min_threshold (float): The starting threshold value.
-        max_threshold (float): The target threshold value at the end of ramp-up.
-        steepness (float, optional): Controls the speed of ramp-up (default=5.0).
-        
-    Returns:
-        float: The computed threshold for the current epoch.
-    """
-    if total_rampup_epochs == 0:
-        return max_threshold
-    current_epoch = max(0.0, min(float(current_epoch), total_rampup_epochs))
-    phase = 1.0 - (current_epoch / total_rampup_epochs)
-    ramp = math.exp(-steepness * (phase ** 2))
-    return min_threshold + (max_threshold - min_threshold) * ramp
-
-def gambling_softmax(logits):
-    """
-    Compute gambling softmax probabilities over the channel dimension.
-    
-    Args:
-        logits (Tensor): Input tensor of shape (B, C, ...).
-    
-    Returns:
-        Tensor: Softmax probabilities of the same shape.
-    """
-    exp_logits = torch.exp(logits)
-    denom = torch.sum(exp_logits, dim=1, keepdim=True)
-    return exp_logits / (denom + 1e-18)
 
 class FeCLoss(nn.Module):
     """
