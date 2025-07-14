@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from .assp import build_aspp3d
 
 class ConvBlock(nn.Module):
     def __init__(self, n_stages, n_filters_in, n_filters_out, normalization='none'):
@@ -144,11 +143,9 @@ class Upsampling(nn.Module):
 
 
 class VNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=2, n_filters=16, scale_factor=4, normalization='none', use_assp=False, has_dropout=False):
+    def __init__(self, n_channels=3, n_classes=2, n_filters=16, normalization='none', has_dropout=False):
         super(VNet, self).__init__()
         self.has_dropout = has_dropout
-        self.use_assp = use_assp
-        self.scale_factor = scale_factor
 
         self.block_one = ConvBlock(1, n_channels, n_filters, normalization=normalization)
         self.block_one_dw = DownsamplingConvBlock(n_filters, 2 * n_filters, normalization=normalization)
@@ -163,9 +160,9 @@ class VNet(nn.Module):
         self.block_four_dw = DownsamplingConvBlock(n_filters * 8, n_filters * 16, normalization=normalization)
 
         self.block_five = ConvBlock(3, n_filters * 16, n_filters * 16, normalization=normalization)
-        self.block_five_up = UpsamplingDeconvBlock(n_filters * 16, n_filters * 8, normalization=normalization) # 16 -> 8
+        self.block_five_up = UpsamplingDeconvBlock(n_filters * 16, n_filters * 8, normalization=normalization)
 
-        self.block_six = ConvBlock(3, n_filters * 8, n_filters * 8, normalization=normalization) # 8 -> 8
+        self.block_six = ConvBlock(3, n_filters * 8, n_filters * 8, normalization=normalization)
         self.block_six_up = UpsamplingDeconvBlock(n_filters * 8, n_filters * 4, normalization=normalization)
 
         self.block_seven = ConvBlock(3, n_filters * 4, n_filters * 4, normalization=normalization)
@@ -179,22 +176,7 @@ class VNet(nn.Module):
 
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
         # self.__init_weight()
-        self.tanh = nn.Tanh()
 
-        self.out_conv2 = nn.Conv3d(n_filters, n_classes, 1, padding=0)
-        self.tanh = nn.Tanh()
-
-        # ASSP module
-        if self.use_assp:
-            self.assp = build_aspp3d(inplanes=n_filters * 16, outplanes=n_filters * 16, output_stride=16, BatchNorm=nn.BatchNorm3d)
-
-        # Projection head
-        self.projection = nn.Sequential(
-                nn.Conv3d(n_filters * 16, 512, kernel_size=1),
-                nn.BatchNorm3d(512),
-                nn.Conv3d(512, 256, kernel_size=1)
-            )
-        
     def encoder(self, input):
         x1 = self.block_one(input)
         x1_dw = self.block_one_dw(x1)
@@ -209,6 +191,7 @@ class VNet(nn.Module):
         x4_dw = self.block_four_dw(x4)
 
         x5 = self.block_five(x4_dw)
+        # x5 = F.dropout3d(x5, p=0.5, training=True)
         if self.has_dropout:
             x5 = self.dropout(x5)
 
@@ -221,17 +204,9 @@ class VNet(nn.Module):
         x2 = features[1]
         x3 = features[2]
         x4 = features[3]
-        center = features[4]
-        
-        # ASSP module
-        if self.use_assp:
-            center = self.assp(center)
+        x5 = features[4]
 
-        # the projection
-        center_ = F.interpolate(center, scale_factor=self.scale_factor, mode='trilinear', align_corners=True) 
-        embeddings = self.projection(center_) 
-
-        x5_up = self.block_five_up(center)
+        x5_up = self.block_five_up(x5)
         x5_up = x5_up + x4
 
         x6 = self.block_six(x5_up)
@@ -246,13 +221,11 @@ class VNet(nn.Module):
         x8_up = self.block_eight_up(x8)
         x8_up = x8_up + x1
         x9 = self.block_nine(x8_up)
-
+        # x9 = F.dropout3d(x9, p=0.5, training=True)
         if self.has_dropout:
             x9 = self.dropout(x9)
-            
         out = self.out_conv(x9)
-        output_sdf = self.tanh(out)
-        return output_sdf, out, embeddings
+        return out
 
 
     def forward(self, input, turnoff_drop=False):
@@ -265,33 +238,21 @@ class VNet(nn.Module):
             self.has_dropout = has_dropout
         return out
 
-    def __init_weight(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv3d):
-                torch.nn.init.kaiming_normal_(m.weight)
-            elif isinstance(m, nn.BatchNorm3d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-
+    # def __init_weight(self):
+    #     for m in self.modules():
+    #         if isinstance(m, nn.Conv3d):
+    #             torch.nn.init.kaiming_normal_(m.weight)
+    #         elif isinstance(m, nn.BatchNorm3d):
+    #             m.weight.data.fill_(1)
+    #             m.bias.data.zero_()
 if __name__ == '__main__':
     # compute FLOPS & PARAMETERS
     from thop import profile
     from thop import clever_format
-
-    model = VNet(n_channels=1, n_classes=2, scale_factor=4, has_dropout=True, use_assp=False).cuda(2)
-    input = torch.randn(4, 1, 96, 96, 64).cuda(2)
-
-    output, regression, embeddings = model(input)
-    print(f"output: {output.shape}, regression: {regression.shape}, embeddings: {embeddings.shape}")    
+    model = VNet(n_channels=1, n_classes=2)
+    input = torch.randn(4, 1, 112, 112, 80)
     flops, params = profile(model, inputs=(input,))
+    print(flops, params)
     macs, params = clever_format([flops, params], "%.3f")
-    print(f"macs: {macs}, params: {params}")
-    # print("VNet have {:.3f}M paramerters in total".format(int(sum(x.numel() for x in model.parameters())/1e6)))
-    """
-    output: torch.Size([4, 2, 96, 96, 64]), 
-    regression: torch.Size([4, 2, 96, 96, 64]), 
-    embeddings: torch.Size([4, 256, 48, 48, 32])
-
-    macs: 188.064G
-    params: 9.707M
-    """
+    print(macs, params)
+    print("VNet have {} paramerters in total".format(sum(x.numel() for x in model.parameters())))
