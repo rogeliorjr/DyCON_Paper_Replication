@@ -76,6 +76,8 @@ snapshot_path = (
 
 os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id) # Only GPU `args.gpu_id` is visible
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 batch_size = args.batch_size 
 max_iterations = args.max_iterations
 base_lr = args.base_lr
@@ -103,7 +105,7 @@ def update_ema_variables(model, ema_model, alpha, global_step):
     # Use the true average until the exponential average is more correct
     alpha = min(1 - 1 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+        ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
 
 from matplotlib import pyplot as plt
 
