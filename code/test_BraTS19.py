@@ -57,7 +57,8 @@ with open(os.path.join(args.root_path, "val.txt"), 'r') as f:
 
 def test_calculate_metric():
     net = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=num_classes, scaler=args.feature_scaler)
-    model = net.cuda() 
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = net.to(device)
     save_model_path = os.path.join(snapshot_path, '{}_best_model.pth'.format(args.model))
     model.load_state_dict(torch.load(save_model_path, map_location='cpu'))
     print("init weight from {}".format(save_model_path))
