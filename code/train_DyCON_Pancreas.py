@@ -92,7 +92,8 @@ else:
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
-torch.cuda.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(args.seed)
 
 num_classes = args.num_classes = 2
 patch_size = args.patch_size = (112, 112, 96) 
@@ -135,7 +136,7 @@ if __name__ == "__main__":
 
     def create_model(ema=False):
         net = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=num_classes, scaler=args.feature_scaler)
-        model = net.cuda() # Now 'cuda:0' refers to physical GPU 3
+        model = net.to(device)
         if ema:
             for param in model.parameters():
                 param.detach_()
@@ -163,7 +164,7 @@ if __name__ == "__main__":
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
 
-    trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+    trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=0, pin_memory=True, worker_init_fn=worker_init_fn)
         
     model.train()
     ema_model.train()
@@ -186,7 +187,8 @@ if __name__ == "__main__":
     iterator = tqdm(range(max_epoch), ncols=70)
 
     uncl_criterion = dycon_losses.UnCLoss()
-    fecl_criterion = dycon_losses.FeCLoss(device=f"cuda:0", temperature=args.temp, gamma=args.gamma, use_focal=bool(args.use_focal), rampup_epochs=1500)
+    fecl_criterion = dycon_losses.FeCLoss(device=device, temperature=args.temp, gamma=args.gamma,
+                                          use_focal=bool(args.use_focal), rampup_epochs=1500)
     
     for epoch_num in iterator:
 
@@ -196,7 +198,7 @@ if __name__ == "__main__":
             beta = dycon_losses.adaptive_beta(epoch=epoch_num, total_epochs=max_epoch, max_beta=args.beta_max, min_beta=args.beta_min)
 
         for i_batch, sampled_batch in enumerate(trainloader):
-            volume_batch, label_batch = sampled_batch['image'].cuda(), sampled_batch['label'].cuda()
+            volume_batch, label_batch = sampled_batch['image'].to(device), sampled_batch['label'].to(device)
             
             noise = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)
             ema_inputs = volume_batch + noise
