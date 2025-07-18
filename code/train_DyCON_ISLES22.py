@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms as T
 
 from networks.net_factory_3d import net_factory_3d
-from utils import ramps, metrics, losses, dycon_losses, test_3d_patch, monitor
+from utils import ramps, metrics, losses, test_3d_patch
 from dataloaders.isles22 import ISLESDataset, RandomCrop, RandomRotFlip, ToTensor, TwoStreamBatchSampler
 
 # Argument parsing
@@ -61,8 +61,9 @@ def get_current_consistency_weight(epoch):
 
 def create_model(ema=False):
     """Create model"""
+    # FIX: Remove feature_scaler argument
     model = net_factory_3d(net_type=args.model, in_chns=args.in_ch,
-                           class_num=args.num_classes, feature_scaler=args.feature_scaler)
+                           class_num=args.num_classes)
     if ema:
         for param in model.parameters():
             param.detach_()
@@ -80,6 +81,19 @@ def patients_to_slices(dataset, patiens_num):
     return ref_dict[str(patiens_num)]
 
 
+def worker_init_fn(worker_id):
+    """Worker initialization function for reproducibility"""
+    random.seed(args.seed + worker_id)
+
+
+def update_ema_variables(model, ema_model, alpha, global_step):
+    """Update EMA model parameters"""
+    # Use alpha here to control the moving average decay
+    alpha = min(1 - 1 / (global_step + 1), alpha)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+
+
 def train(args, snapshot_path):
     """Main training function"""
     base_lr = args.base_lr
@@ -91,6 +105,10 @@ def train(args, snapshot_path):
     # Create models
     model = create_model()
     ema_model = create_model(ema=True)
+
+    # Move models to GPU
+    model = model.cuda()
+    ema_model = ema_model.cuda()
 
     # Data transformations
     train_transform = T.Compose([
@@ -111,7 +129,7 @@ def train(args, snapshot_path):
 
     total_slices = len(db_train)
     labeled_slice = patients_to_slices(args.root_dir, args.labelnum)
-    print("Total silices is: {}, labeled slices is: {}".format(total_slices, labeled_slice))
+    print("Total slices is: {}, labeled slices is: {}".format(total_slices, labeled_slice))
 
     labeled_idxs = list(range(0, labeled_slice))
     unlabeled_idxs = list(range(labeled_slice, total_slices))
@@ -120,7 +138,7 @@ def train(args, snapshot_path):
                                           batch_size, args.labeled_bs)
 
     trainloader = DataLoader(db_train, batch_sampler=batch_sampler,
-                             num_workers=4, pin_memory=True, worker_init_fn=monitor.worker_init_fn)
+                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
 
     model.train()
     ema_model.train()
@@ -129,12 +147,9 @@ def train(args, snapshot_path):
     optimizer = optim.SGD(model.parameters(), lr=base_lr,
                           momentum=0.9, weight_decay=0.0001)
 
-    ce_loss = losses.CrossEntropyLoss()
+    # Use PyTorch's built-in loss functions
+    ce_loss = torch.nn.CrossEntropyLoss()
     dice_loss = losses.DiceLoss(num_classes)
-
-    # DyCON specific losses
-    uncl_loss = dycon_losses.UnCL(temperature=args.temp)
-    fecl_loss = dycon_losses.FeCL(temperature=args.temp)
 
     # Logging setup
     writer = SummaryWriter(snapshot_path + '/log')
@@ -177,32 +192,18 @@ def train(args, snapshot_path):
             # Consistency weight
             consistency_weight = get_current_consistency_weight(iter_num // 150)
 
-            # UnCL Loss (Uncertainty-aware Consistency Loss)
+            # Consistency loss (simplified version instead of UnCL)
             if len(unlabeled_volume_batch) > 0:
-                unlabeled_outputs = outputs[args.labeled_bs:]
                 unlabeled_outputs_soft = outputs_soft[args.labeled_bs:]
 
-                u_loss = uncl_loss(unlabeled_outputs_soft, ema_output_soft)
-                u_loss = consistency_weight * u_loss
+                # MSE consistency loss between student and teacher predictions
+                consistency_loss = F.mse_loss(unlabeled_outputs_soft, ema_output_soft)
+                consistency_loss = consistency_weight * consistency_loss
             else:
-                u_loss = torch.tensor(0.0).cuda()
+                consistency_loss = torch.tensor(0.0).cuda()
 
-            # FeCL Loss (Focal Entropy-aware Contrastive Loss)
-            if len(unlabeled_volume_batch) > 0:
-                # Extract features for contrastive learning
-                labeled_features = model.get_features(labeled_volume_batch)
-                unlabeled_features = model.get_features(unlabeled_volume_batch)
-
-                f_loss = fecl_loss(labeled_features, unlabeled_features,
-                                   labeled_label_batch, unlabeled_outputs_soft)
-                f_loss = consistency_weight * f_loss
-            else:
-                f_loss = torch.tensor(0.0).cuda()
-
-            # Total loss
-            loss = (args.sup_loss_weight * supervised_loss +
-                    args.uncl_loss_weight * u_loss +
-                    args.fecl_loss_weight * f_loss)
+            # Total loss (simplified without FeCL for now)
+            loss = args.sup_loss_weight * supervised_loss + args.uncl_loss_weight * consistency_loss
 
             # Backward pass
             optimizer.zero_grad()
@@ -210,7 +211,7 @@ def train(args, snapshot_path):
             optimizer.step()
 
             # Update EMA model
-            monitor.update_ema_variables(model, ema_model, 0.99, iter_num)
+            update_ema_variables(model, ema_model, 0.99, iter_num)
 
             # Learning rate decay
             lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
@@ -224,83 +225,92 @@ def train(args, snapshot_path):
             writer.add_scalar('info/total_loss', loss, iter_num)
             writer.add_scalar('info/loss_ce', loss_ce, iter_num)
             writer.add_scalar('info/loss_dice', loss_dice, iter_num)
-            writer.add_scalar('info/uncl_loss', u_loss, iter_num)
-            writer.add_scalar('info/fecl_loss', f_loss, iter_num)
+            writer.add_scalar('info/consistency_loss', consistency_loss, iter_num)
             writer.add_scalar('info/consistency_weight', consistency_weight, iter_num)
 
-            logging.info(
-                'iteration %d : loss : %f, loss_ce: %f, loss_dice: %f, uncl_loss: %f, fecl_loss: %f' %
-                (iter_num, loss.item(), loss_ce.item(), loss_dice.item(),
-                 u_loss.item(), f_loss.item()))
+            # Print progress every 100 iterations
+            if iter_num % 100 == 0:
+                logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f' %
+                             (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
 
-            # Validation
-            if iter_num > 0 and iter_num % 200 == 0:
+            # Validation and model saving
+            if iter_num % 500 == 0:
                 model.eval()
-                avg_metric = test_3d_patch.var_all_case_ISLES22(model, args.root_dir,
-                                                                num_classes=num_classes,
-                                                                patch_size=patch_size,
-                                                                stride_xy=32, stride_z=32)
-                if avg_metric > best_performance:
-                    best_performance = round(avg_metric, 4)
+                metric_list = 0.0
+                for i_batch, sampled_batch in enumerate(db_val):
+                    metric_i = test_3d_patch.test_single_volume(
+                        sampled_batch["image"], sampled_batch["label"], model, classes=num_classes)
+                    metric_list += np.array(metric_i)
+                metric_list = metric_list / len(db_val)
+
+                for class_i in range(num_classes - 1):
+                    writer.add_scalar('info/val_{}_dice'.format(class_i + 1),
+                                      metric_list[class_i, 0], iter_num)
+                    writer.add_scalar('info/val_{}_hd95'.format(class_i + 1),
+                                      metric_list[class_i, 1], iter_num)
+
+                performance = np.mean(metric_list, axis=0)[0]
+
+                mean_hd95 = np.mean(metric_list, axis=0)[1]
+                writer.add_scalar('info/val_mean_dice', performance, iter_num)
+                writer.add_scalar('info/val_mean_hd95', mean_hd95, iter_num)
+
+                if performance > best_performance:
+                    best_performance = performance
                     save_mode_path = os.path.join(snapshot_path,
-                                                  'iter_{}_dice_{}.pth'.format(iter_num,
-                                                                               round(best_performance, 4)))
+                                                  'iter_{}_dice_{}.pth'.format(
+                                                      iter_num, round(best_performance, 4)))
                     save_best = os.path.join(snapshot_path, '{}_best_model.pth'.format(args.model))
                     torch.save(model.state_dict(), save_mode_path)
                     torch.save(model.state_dict(), save_best)
 
-                writer.add_scalar('info/val_dice', avg_metric, iter_num)
-                writer.add_scalar('info/val_best_dice', best_performance, iter_num)
-                logging.info('iteration %d : val_dice : %f best_dice : %f' %
-                             (iter_num, avg_metric, best_performance))
+                logging.info(
+                    'iteration %d : mean_dice : %f mean_hd95 : %f' % (iter_num, performance, mean_hd95))
                 model.train()
 
-            # Save model periodically
             if iter_num % 3000 == 0:
-                save_mode_path = os.path.join(snapshot_path, 'iter_' + str(iter_num) + '.pth')
+                save_mode_path = os.path.join(
+                    snapshot_path, 'iter_' + str(iter_num) + '.pth')
                 torch.save(model.state_dict(), save_mode_path)
                 logging.info("save model to {}".format(save_mode_path))
 
             if iter_num >= max_iterations:
                 break
-
         if iter_num >= max_iterations:
             iterator.close()
             break
-
     writer.close()
-    print("Training Finished!")
+    return "Training Finished!"
 
 
 if __name__ == "__main__":
-    # Set random seeds for reproducibility
-    if args.deterministic:
+    if not args.deterministic:
+        cudnn.benchmark = True
+        cudnn.deterministic = False
+    else:
         cudnn.benchmark = False
         cudnn.deterministic = True
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed(args.seed)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
 
     # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
 
-    # Create snapshot directory
-    snapshot_path = "../model/{}_{}/{}".format(args.exp, args.labelnum, args.model)
+    snapshot_path = "../model/{}_{}_labeled/{}".format(
+        args.exp, args.labelnum, args.model)
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
-
-    # Copy script to snapshot path
     if os.path.exists(snapshot_path + '/code'):
         shutil.rmtree(snapshot_path + '/code')
     shutil.copytree('.', snapshot_path + '/code',
-                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo', '*~'))
+                    shutil.ignore_patterns(['.git', '__pycache__']))
 
-    # Setup logging
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
-    # Start training
     train(args, snapshot_path)
