@@ -314,6 +314,14 @@ if __name__ == "__main__":
     print("🔄 Processing training data...")
     preprocess_brats2019(RAW_DATA_DIR, OUTPUT_DIR, TRAIN_SPLIT_FILE)
 
+    # Process validation data
+    VAL_SPLIT_FILE = "../data/BraTS2019/val.txt"
+    if not os.path.exists(VAL_SPLIT_FILE):
+        VAL_SPLIT_FILE = "./data/BraTS2019/val.txt"
+
+    print("\n🔄 Processing validation data...")
+    preprocess_brats2019(RAW_DATA_DIR, OUTPUT_DIR, VAL_SPLIT_FILE)
+
     # Process test data
     TEST_SPLIT_FILE = "../data/BraTS2019/test.txt"
     if not os.path.exists(TEST_SPLIT_FILE):
