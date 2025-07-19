@@ -9,4 +9,4 @@ python train_DyCON_BraTS19.py \
 --temp 0.6 \
 --batch_size 8 \
 --labelnum 25 \
---gpu_id 0 
+--gpu_ids 0
