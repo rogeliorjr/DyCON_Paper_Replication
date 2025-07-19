@@ -9,4 +9,4 @@ python train_DyCON_Pancreas.py \
 --temp 0.6 \
 --batch_size 8 \
 --labelnum 12 \
---gpu_id 3
+--gpu_id 0
