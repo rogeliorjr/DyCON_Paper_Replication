@@ -26,7 +26,7 @@ import torchvision.transforms as T
 import torch.backends.cudnn as cudnn
 
 from dataloaders.isles22 import ISLESDataset, RandomCrop, RandomRotFlip, ToTensor, TwoStreamBatchSampler
-from networks.net_factory_3d import net_factory_3d
+from networks.net_factory import net_factory_3d
 from utils import losses, metrics, ramps
 from utils import dycon_losses
 
@@ -58,64 +58,87 @@ parser.add_argument('--beta_min', type=float, default=0.5, help='Minimum value f
 parser.add_argument('--beta_max', type=float, default=5.0, help='Maximum value for entropy weighting (β)')
 parser.add_argument('--s_beta', type=float, default=None,
                     help='If provided, use this static beta for UnCLoss instead of adaptive beta.')
-parser.add_argument('--temp', type=float, default=0.6, help='Temperature for contrastive learning')
-parser.add_argument('--l_weight', type=float, default=1.0, help='Weight for labeled losses')
-parser.add_argument('--u_weight', type=float, default=0.5, help='Weight for UnCL loss')
-parser.add_argument('--use_focal', type=int, default=1, help='Use focal mechanism in FeCL')
-parser.add_argument('--use_teacher_loss', type=int, default=1, help='Use teacher features in FeCL')
+parser.add_argument('--temp', type=float, default=0.6,
+                    help='Temperature for contrastive softmax scaling (optimal: 0.6)')
+parser.add_argument('--l_weight', type=float, default=1.0, help='Weight for supervised losses')
+parser.add_argument('--u_weight', type=float, default=0.5, help='Weight for unsupervised losses (UnCL + FeCL)')
+parser.add_argument('--use_focal', type=int, default=1, help='Whether to use focal weighting (1 for True, 0 for False)')
+parser.add_argument('--use_teacher_loss', type=int, default=1,
+                    help='Use teacher-based auxiliary loss (1 for True, 0 for False)')
 
-# === Architecture Parameters === #
-parser.add_argument('--patch_size', type=int, nargs='+', default=[96, 96, 64], help='Patch size for training')
+# === Data Augmentation === #
+parser.add_argument('--patch_size', type=int, nargs=3, default=[96, 96, 64], help='Patch size for training')
+
+# === Network Parameters === #
 parser.add_argument('--in_ch', type=int, default=1, help='Input channels')
 parser.add_argument('--num_classes', type=int, default=2, help='Number of output classes')
 parser.add_argument('--feature_scaler', type=int, default=4, help='Downscaling factor for feature maps')
 
 # === Misc Parameters === #
-parser.add_argument('--deterministic', type=int, default=1, help='Whether to set deterministic options')
-parser.add_argument('--seed', type=int, default=1337, help='Random seed')
+parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
+parser.add_argument('--seed', type=int, default=1337, help='random seed')
 
 args = parser.parse_args()
+
+# ========== Deterministic Settings ========== #
+if args.deterministic:
+    cudnn.benchmark = False
+    cudnn.deterministic = True
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
 
 # ========== Path Setup ========== #
 snapshot_path = f"../model/{args.exp}/DyCON_{args.model}_{args.consistency_type}_temp{args.temp}" \
                 f"_labelnum{args.labelnum}_max_iterations{args.max_iterations}"
+if not os.path.exists(snapshot_path):
+    os.makedirs(snapshot_path)
 
 os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# ========== Training Configuration ========== #
 batch_size = args.batch_size
+labeled_bs = args.labeled_bs
 max_iterations = args.max_iterations
 base_lr = args.base_lr
-labeled_bs = args.labeled_bs
 
-if not args.deterministic:
-    cudnn.benchmark = True
-    cudnn.deterministic = False
-else:
-    cudnn.benchmark = True
-    cudnn.deterministic = True
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(args.seed)
+# ========== Create Model ========== #
+model = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=args.num_classes,
+                       scaler=args.feature_scaler)
+model = model.to(device)
 
-num_classes = args.num_classes
-patch_size = tuple(args.patch_size)
+ema_model = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=args.num_classes,
+                           scaler=args.feature_scaler)
+ema_model = ema_model.to(device)
+ema_model.eval()
+
+# Copy weights from model to ema_model
+for param, ema_param in zip(model.parameters(), ema_model.parameters()):
+    ema_param.data.copy_(param.data)
+
+print(f"Total params of model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
 
-# ========== Helper Functions ========== #
+# ========== Utility Functions ========== #
 def get_current_consistency_weight(epoch):
-    # Consistency ramp-up from https://arxiv.org/abs/1610.02242
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
 def update_ema_variables(model, ema_model, alpha, global_step):
-    # Use the true average until the exponential average is more correct
     alpha = min(1 - 1 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+
+
+def plot_samples(image, mask, epoch):
+    """Plot sample slices of the image/preds and mask"""
+    # image: (C, H, W, D), mask: (H, W, D)
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].imshow(image[1][:, :, image.shape[-1] // 2], cmap='gray')  # access the class at index 1
+    ax[1].imshow(mask[:, :, mask.shape[-1] // 2], cmap='viridis')
+    plt.savefig(f'../misc/train_preds/ISLES22_sample_slice_{str(epoch)}.png')
+    plt.close()
 
 
 def patients_to_slices(dataset_path, labelnum):
@@ -125,71 +148,50 @@ def patients_to_slices(dataset_path, labelnum):
     return labelnum
 
 
-def worker_init_fn(worker_id):
-    random.seed(args.seed + worker_id)
-
-
-# ========== Main Training ========== #
+# ========== Main Training Function ========== #
 if __name__ == "__main__":
-    # Create snapshot directory
+    # Create directories
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
     if os.path.exists(snapshot_path + '/code'):
         shutil.rmtree(snapshot_path + '/code')
     shutil.copytree('.', snapshot_path + '/code', shutil.ignore_patterns(['.git', '__pycache__']))
 
-    # Logging setup
+    # ========== Logging Setup ========== #
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
-    # ========== Model and EMA Model Setup ========== #
-    model = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=num_classes)
-    model = model.to(device)
+    # ========== Dataset Setup ========== #
+    train_transform = T.Compose([
+        RandomCrop(args.patch_size),
+        RandomRotFlip(),
+        ToTensor()
+    ])
 
-    # Initialize EMA model
-    ema_model = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=num_classes)
-    ema_model = ema_model.to(device)
-    for param in ema_model.parameters():
-        param.detach_()
-
-    # Log model size
-    model_params = sum(p.numel() for p in model.parameters()) / 1e6
-    logging.info(f"Total params of model: {model_params:.2f}M")
-
-    # ========== Data Loading ========== #
-    # Create dataset
     db_train = ISLESDataset(h5_dir=args.root_dir,
                             split='train',
-                            transform=T.Compose([
-                                RandomRotFlip(),
-                                RandomCrop(patch_size),
-                                ToTensor(),
-                            ]))
+                            transform=train_transform)
+
     db_val = ISLESDataset(h5_dir=args.root_dir,
                           split='val',
-                          transform=T.Compose([
-                              RandomCrop(patch_size),
-                              ToTensor()
-                          ]))
+                          transform=T.Compose([ToTensor()]))
 
-    # Log data splits
     total_slices = len(db_train)
     labeled_slice = patients_to_slices(args.root_dir, args.labelnum)
-    logging.info(f"Total slices is: {total_slices}, labeled slices is: {labeled_slice}")
+    print(f"Total slices is: {total_slices}, labeled slices is: {labeled_slice}")
 
     labeled_idxs = list(range(0, labeled_slice))
     unlabeled_idxs = list(range(labeled_slice, total_slices))
 
     batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size - labeled_bs)
 
-    trainloader = DataLoader(db_train, batch_sampler=batch_sampler,
-                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
-    valloader = DataLoader(db_val, batch_size=1, shuffle=False, num_workers=1)
+    trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=4, pin_memory=True)
 
-    model.train()
-    ema_model.train()
+    # ========== Loss Setup ========== #
+    ce_loss = CrossEntropyLoss()
+    dice_loss = losses.DiceLoss(args.num_classes)
 
     # ========== Optimizer and Loss Setup ========== #
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
@@ -241,123 +243,140 @@ if __name__ == "__main__":
             consistency_weight = get_current_consistency_weight(iter_num // 150)
 
             # Calculate the supervised loss
-            loss_seg = F.cross_entropy(stud_logits[:labeled_bs], label_batch[:labeled_bs])
-            loss_seg_dice = losses.dice_loss(stud_probs[:labeled_bs, 1, :, :, :], label_batch[:labeled_bs] == 1)
+            loss_seg = ce_loss(stud_logits[:labeled_bs], label_batch[:labeled_bs].long())
+            loss_seg_dice = dice_loss(stud_probs[:labeled_bs], label_batch[:labeled_bs].unsqueeze(1))
 
-            # Prepare embeddings for contrastive learning
+            # Compute FeCL loss (batch-wise contrastive learning)
+            # Prepare embeddings properly
             B, C, _, _, _ = stud_features.shape
-            stud_embedding = stud_features.view(B, C, -1)
-            stud_embedding = torch.transpose(stud_embedding, 1, 2)
-            stud_embedding = F.normalize(stud_embedding, dim=-1)
+            stud_embedding_fecl = stud_features.view(B, C, -1)
+            stud_embedding_fecl = torch.transpose(stud_embedding_fecl, 1, 2)
+            stud_embedding_fecl = F.normalize(stud_embedding_fecl, dim=-1)
 
-            ema_embedding = ema_features.view(B, C, -1)
-            ema_embedding = torch.transpose(ema_embedding, 1, 2)
-            ema_embedding = F.normalize(ema_embedding, dim=-1)
+            ema_embedding_fecl = ema_features.view(B, C, -1)
+            ema_embedding_fecl = torch.transpose(ema_embedding_fecl, 1, 2)
+            ema_embedding_fecl = F.normalize(ema_embedding_fecl, dim=-1)
 
-            # Create mask for contrastive learning with dynamic downsampling factor
-            # Calculate the actual downsampling factor based on feature dimensions
-            _, _, H_f, W_f, D_f = stud_features.shape
-            H_in, W_in, D_in = patch_size
-            downsample_factor = H_in // H_f  # This should give you the correct factor
+            # Create mask for contrastive learning
+            mask_con_fecl = F.avg_pool3d(label_batch.float(), kernel_size=args.feature_scaler * 4,
+                                         stride=args.feature_scaler * 4)
+            mask_con_fecl = (mask_con_fecl > 0.5).float()
+            mask_con_fecl = mask_con_fecl.reshape(B, -1)
+            mask_con_fecl = mask_con_fecl.unsqueeze(1)
 
-            # Create mask with correct downsampling
-            mask_con = F.avg_pool3d(label_batch.float(), kernel_size=downsample_factor,
-                                    stride=downsample_factor)
-            mask_con = (mask_con > 0.5).float()
-            mask_con = mask_con.reshape(B, -1)
-            mask_con = mask_con.unsqueeze(1)
-
-            # Calculate DyCON losses
-            teacher_feat = ema_embedding if args.use_teacher_loss else None
-            f_loss = fecl_criterion(feat=stud_embedding,
-                                    mask=mask_con,
+            teacher_feat = ema_embedding_fecl if args.use_teacher_loss else None
+            f_loss = fecl_criterion(feat=stud_embedding_fecl,
+                                    mask=mask_con_fecl,
                                     teacher_feat=teacher_feat,
+                                    gambling_uncertainty=None,
                                     epoch=epoch_num)
+
+            # Compute UnCL loss (uncertainty-aware consistency)
             u_loss = uncl_criterion(stud_logits, ema_logits, beta)
             consistency_loss = consistency_criterion(stud_probs[labeled_bs:], ema_probs[labeled_bs:]).mean()
 
-            # Combine all losses
-            loss = args.l_weight * (loss_seg + loss_seg_dice) + \
-                   consistency_weight * consistency_loss + \
-                   args.u_weight * (f_loss + u_loss)
+            # Gather losses
+            loss = args.l_weight * (
+                    loss_seg + loss_seg_dice) + consistency_weight * consistency_loss + args.u_weight * (
+                           f_loss + u_loss)
 
             # Check for NaN or Inf values
             if torch.isnan(loss) or torch.isinf(loss):
                 logging.warning(f"NaN or Inf found in loss at iteration {iter_num}")
                 continue
 
-            # Backward pass and optimization
             optimizer.zero_grad()
             loss.backward()
 
             # Apply gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             # Update EMA model
             update_ema_variables(model, ema_model, args.ema_decay, iter_num)
 
-            # ========== Logging ========== #
-            iter_num += 1
-            writer.add_scalar('info/total_loss', loss, iter_num)
-            writer.add_scalar('info/loss_seg', loss_seg, iter_num)
-            writer.add_scalar('info/loss_seg_dice', loss_seg_dice, iter_num)
-            writer.add_scalar('info/consistency_loss', consistency_loss, iter_num)
-            writer.add_scalar('info/consistency_weight', consistency_weight, iter_num)
+            iter_num = iter_num + 1
+
+            # Logging
+            writer.add_scalar('info/loss', loss, iter_num)
             writer.add_scalar('info/f_loss', f_loss, iter_num)
             writer.add_scalar('info/u_loss', u_loss, iter_num)
-            writer.add_scalar('info/beta', beta, iter_num)
+            writer.add_scalar('info/loss_ce', loss_seg, iter_num)
+            writer.add_scalar('info/loss_dice', loss_seg_dice, iter_num)
+            writer.add_scalar('info/consistency_loss', consistency_loss, iter_num)
+            writer.add_scalar('info/consistency_weight', consistency_weight, iter_num)
 
-            logging.info(f'iteration {iter_num} : loss : {loss.item():.4f}, '
-                         f'loss_seg: {loss_seg.item():.4f}, loss_seg_dice: {loss_seg_dice.item():.4f}, '
-                         f'f_loss: {f_loss.item():.4f}, u_loss: {u_loss.item():.4f}')
+            # Clean up
+            del noise, stud_embedding_fecl, ema_embedding_fecl, ema_logits, ema_features, ema_probs, mask_con_fecl
 
-            # ========== Validation ========== #
-            if iter_num % 100 == 0:
+            # Calculate training metrics
+            with torch.no_grad():
+                outputs_bin = (stud_probs[:, 1, :, :, :] > 0.5).float()
+                dice_score = metrics.compute_dice(outputs_bin, label_batch)
+                H, W, D = stud_logits.shape[-3:]
+                max_dist = np.linalg.norm([H, W, D])
+                hausdorff_score = metrics.compute_hd95(outputs_bin, label_batch, max_dist)
+
+            writer.add_scalar('train/Dice', dice_score.mean().item(), iter_num)
+            writer.add_scalar('train/HD95', hausdorff_score.mean().item(), iter_num)
+
+            # Periodic logging
+            if iter_num % 50 == 0:
+                logging.info('iteration %d : loss : %f loss_seg: %f loss_seg_dice: %f f_loss: %f u_loss: %f'
+                             % (iter_num, loss.item(), loss_seg.item(), loss_seg_dice.item(),
+                                f_loss.item(), u_loss.item()))
+
+            # Periodic validation and checkpointing
+            if iter_num > 0 and iter_num % 200 == 0:
                 model.eval()
-                metric_list = []
-                for i_batch, sampled_batch in enumerate(valloader):
-                    metric_i = metrics.test_single_volume(sampled_batch["image"], sampled_batch["label"],
-                                                          model, classes=num_classes, patch_size=patch_size)
-                    metric_list.append(metric_i)
+                avg_metric = []
 
-                metric_list = np.array(metric_list)  # (val_size, num_classes, 4)
-                for class_i in range(1, num_classes):
-                    writer.add_scalar(f'info/val_dice_class_{class_i}',
-                                      np.mean(metric_list[:, class_i - 1, 0]), iter_num)
-                    writer.add_scalar(f'info/val_hd95_class_{class_i}',
-                                      np.mean(metric_list[:, class_i - 1, 1]), iter_num)
-                    writer.add_scalar(f'info/val_asd_class_{class_i}',
-                                      np.mean(metric_list[:, class_i - 1, 2]), iter_num)
+                with torch.no_grad():
+                    for i_batch, sampled_batch in enumerate(db_val):
+                        volume_batch, label_batch = sampled_batch['image'].unsqueeze(0).to(device), \
+                            sampled_batch['label'].unsqueeze(0).to(device)
 
-                performance = np.mean(metric_list[:, :, 0])  # mean dice
-                mean_hd95 = np.mean(metric_list[:, :, 1])
-                mean_asd = np.mean(metric_list[:, :, 2])
+                        # Get model predictions
+                        _, outputs = model(volume_batch)
+                        outputs_soft = F.softmax(outputs, dim=1)
+                        outputs_bin = (outputs_soft[:, 1, :, :, :] > 0.5).float()
 
-                writer.add_scalar('info/val_mean_dice', performance, iter_num)
-                writer.add_scalar('info/val_mean_hd95', mean_hd95, iter_num)
-                writer.add_scalar('info/val_mean_asd', mean_asd, iter_num)
+                        # Calculate metrics
+                        dice_score = metrics.compute_dice(outputs_bin, label_batch).item()
 
-                if performance > best_performance:
-                    best_performance = performance
-                    save_best = os.path.join(snapshot_path, f'best_model.pth')
+                        # For HD95, handle edge cases
+                        if outputs_bin.sum() > 0 and label_batch.sum() > 0:
+                            hd95_score = metrics.compute_hd95(outputs_bin, label_batch).item()
+                        else:
+                            hd95_score = 0.0
+
+                        avg_metric.append([dice_score, hd95_score])
+
+                avg_metric = np.array(avg_metric)
+                avg_dice = np.mean(avg_metric[:, 0])
+                avg_hd95 = np.mean(avg_metric[:, 1])
+
+                writer.add_scalar('val/Dice', avg_dice, iter_num)
+                writer.add_scalar('val/HD95', avg_hd95, iter_num)
+
+                logging.info('iteration %d : mean_dice : %f mean_hd95 : %f' % (iter_num, avg_dice, avg_hd95))
+
+                if avg_dice > best_performance:
+                    best_performance = avg_dice
+                    save_mode_path = os.path.join(snapshot_path,
+                                                  'iter_{}_dice_{}.pth'.format(iter_num, round(best_performance, 4)))
+                    save_best = os.path.join(snapshot_path, '{}_best_model.pth'.format(args.model))
+                    torch.save(model.state_dict(), save_mode_path)
                     torch.save(model.state_dict(), save_best)
-                    logging.info(f'iteration {iter_num}, best model saved with dice: {best_performance:.4f}')
 
-                logging.info(f'iteration {iter_num} : mean_dice : {performance:.4f}, '
-                             f'mean_hd95 : {mean_hd95:.4f}, mean_asd : {mean_asd:.4f}')
                 model.train()
 
-            # Save checkpoint
-            if iter_num % 3000 == 0:
-                save_mode_path = os.path.join(snapshot_path, f'iter_{iter_num}.pth')
-                torch.save(model.state_dict(), save_mode_path)
-                logging.info(f"save model to {save_mode_path}")
-
+            # Early stopping check
             if iter_num >= max_iterations:
                 break
+
         if iter_num >= max_iterations:
             iterator.close()
             break
+
     writer.close()
-    logging.info(f"Training completed. Best performance: {best_performance:.4f}")
