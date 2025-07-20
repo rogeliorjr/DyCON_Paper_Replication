@@ -121,41 +121,41 @@ print(f"Total params of model: {sum(p.numel() for p in model.parameters()) / 1e6
 
 
 # ========== Utility Functions ========== #
+def patients_to_slices(dataset_dir, patiens_num):
+    ref_dict = None
+    if "ISLES" in dataset_dir:
+        ref_dict = {"1": 36, "2": 38, "3": 27, "4": 53, "5": 60,
+                    "6": 25, "7": 25, "8": 38, "9": 38, "10": 45,
+                    "11": 27, "12": 29, "13": 32, "14": 29, "15": 44,
+                    "16": 38, "17": 29, "18": 23, "19": 48, "20": 42,
+                    "21": 31, "22": 48, "23": 42, "24": 23, "25": 29}
+    else:
+        print("Error")
+
+    return ref_dict[str(patiens_num)]
+
+
 def get_current_consistency_weight(epoch):
+    # Consistency ramp-up
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 
 def update_ema_variables(model, ema_model, alpha, global_step):
+    # Use the true average until the exponential average is more correct
     alpha = min(1 - 1 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+        ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
 
 
-def plot_samples(image, mask, epoch):
-    """Plot sample slices of the image/preds and mask"""
-    # image: (C, H, W, D), mask: (H, W, D)
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-    ax[0].imshow(image[1][:, :, image.shape[-1] // 2], cmap='gray')  # access the class at index 1
-    ax[1].imshow(mask[:, :, mask.shape[-1] // 2], cmap='viridis')
-    plt.savefig(f'../misc/train_preds/ISLES22_sample_slice_{str(epoch)}.png')
-    plt.close()
-
-
-def patients_to_slices(dataset_path, labelnum):
-    """Convert patient numbers to slice numbers for ISLES dataset"""
-    # For ISLES22, each H5 file contains the full 3D volume
-    # So the number of labeled samples equals the labelnum directly
-    return labelnum
-
-
-# ========== Main Training Function ========== #
+# ========== Main Training ========== #
 if __name__ == "__main__":
-    # Create directories
-    if not os.path.exists(snapshot_path):
-        os.makedirs(snapshot_path)
-    if os.path.exists(snapshot_path + '/code'):
-        shutil.rmtree(snapshot_path + '/code')
-    shutil.copytree('.', snapshot_path + '/code', shutil.ignore_patterns(['.git', '__pycache__']))
+    # Copy current code to snapshot folder
+    shutil.copy('../code/train_DyCON_ISLES22.py', snapshot_path + '/train_DyCON_ISLES22.py')
+    shutil.copy('../code/run_ISLES22.sh', snapshot_path + '/run_ISLES22.sh')
+    shutil.copytree('../code/dataloaders', snapshot_path + '/dataloaders',
+                    shutil.ignore_patterns(['.git', '__pycache__']))
+    shutil.copytree('../code/networks', snapshot_path + '/networks', shutil.ignore_patterns(['.git', '__pycache__']))
+    shutil.copytree('../code/utils', snapshot_path + '/utils', shutil.ignore_patterns(['.git', '__pycache__']))
 
     # ========== Logging Setup ========== #
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
@@ -247,22 +247,45 @@ if __name__ == "__main__":
             loss_seg_dice = dice_loss(stud_probs[:labeled_bs], label_batch[:labeled_bs].unsqueeze(1))
 
             # Compute FeCL loss (batch-wise contrastive learning)
-            # Prepare embeddings properly
-            B, C, _, _, _ = stud_features.shape
-            stud_embedding_fecl = stud_features.view(B, C, -1)
-            stud_embedding_fecl = torch.transpose(stud_embedding_fecl, 1, 2)
+            # Get the spatial dimensions after encoding
+            B, C, H, W, D = stud_features.shape
+
+            # Debug prints to understand dimensions
+            if iter_num == 0:
+                print(f"Input shape: {volume_batch.shape}")
+                print(f"Feature shape: {stud_features.shape}")
+                print(f"Expected N: {H * W * D}")
+
+            # Reshape features to (B, N, C) where N is the number of spatial locations
+            stud_embedding_fecl = stud_features.reshape(B, C, -1)  # (B, C, N)
+            stud_embedding_fecl = stud_embedding_fecl.transpose(1, 2)  # (B, N, C)
             stud_embedding_fecl = F.normalize(stud_embedding_fecl, dim=-1)
 
-            ema_embedding_fecl = ema_features.view(B, C, -1)
-            ema_embedding_fecl = torch.transpose(ema_embedding_fecl, 1, 2)
+            ema_embedding_fecl = ema_features.reshape(B, C, -1)  # (B, C, N)
+            ema_embedding_fecl = ema_embedding_fecl.transpose(1, 2)  # (B, N, C)
             ema_embedding_fecl = F.normalize(ema_embedding_fecl, dim=-1)
 
             # Create mask for contrastive learning
-            mask_con_fecl = F.avg_pool3d(label_batch.float(), kernel_size=args.feature_scaler * 4,
-                                         stride=args.feature_scaler * 4)
+            # Calculate the actual downsampling factor based on feature dimensions
+            downsample_factor_h = volume_batch.shape[2] // stud_features.shape[2]
+            downsample_factor_w = volume_batch.shape[3] // stud_features.shape[3]
+            downsample_factor_d = volume_batch.shape[4] // stud_features.shape[4]
+
+            mask_con_fecl = F.avg_pool3d(label_batch.float(),
+                                         kernel_size=(downsample_factor_h, downsample_factor_w, downsample_factor_d),
+                                         stride=(downsample_factor_h, downsample_factor_w, downsample_factor_d))
             mask_con_fecl = (mask_con_fecl > 0.5).float()
-            mask_con_fecl = mask_con_fecl.reshape(B, -1)
-            mask_con_fecl = mask_con_fecl.unsqueeze(1)
+
+            # Ensure mask has the correct shape
+            N = H * W * D  # Should match the N in embeddings
+            mask_con_fecl = mask_con_fecl.reshape(B, -1)  # (B, N)
+
+            # Verify the shapes match
+            assert mask_con_fecl.shape[1] == stud_embedding_fecl.shape[1], \
+                f"Mask shape {mask_con_fecl.shape} doesn't match embedding shape {stud_embedding_fecl.shape}"
+
+            # Add the batch dimension for the mask
+            mask_con_fecl = mask_con_fecl.unsqueeze(1)  # (B, 1, N)
 
             teacher_feat = ema_embedding_fecl if args.use_teacher_loss else None
             f_loss = fecl_criterion(feat=stud_embedding_fecl,
@@ -295,88 +318,86 @@ if __name__ == "__main__":
             # Update EMA model
             update_ema_variables(model, ema_model, args.ema_decay, iter_num)
 
+            # Learning rate schedule
+            lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr_
+
             iter_num = iter_num + 1
 
-            # Logging
-            writer.add_scalar('info/loss', loss, iter_num)
-            writer.add_scalar('info/f_loss', f_loss, iter_num)
-            writer.add_scalar('info/u_loss', u_loss, iter_num)
-            writer.add_scalar('info/loss_ce', loss_seg, iter_num)
-            writer.add_scalar('info/loss_dice', loss_seg_dice, iter_num)
-            writer.add_scalar('info/consistency_loss', consistency_loss, iter_num)
+            # ========== Logging ========== #
+            writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/consistency_weight', consistency_weight, iter_num)
 
-            # Clean up
-            del noise, stud_embedding_fecl, ema_embedding_fecl, ema_logits, ema_features, ema_probs, mask_con_fecl
+            writer.add_scalar('loss/loss', loss, iter_num)
+            writer.add_scalar('loss/loss_seg', loss_seg, iter_num)
+            writer.add_scalar('loss/loss_seg_dice', loss_seg_dice, iter_num)
+            writer.add_scalar('loss/loss_consistency', consistency_loss, iter_num)
+            writer.add_scalar('loss/loss_fecl', f_loss, iter_num)
+            writer.add_scalar('loss/loss_uncl', u_loss, iter_num)
 
-            # Calculate training metrics
-            with torch.no_grad():
-                outputs_bin = (stud_probs[:, 1, :, :, :] > 0.5).float()
-                dice_score = metrics.compute_dice(outputs_bin, label_batch)
-                H, W, D = stud_logits.shape[-3:]
-                max_dist = np.linalg.norm([H, W, D])
-                hausdorff_score = metrics.compute_hd95(outputs_bin, label_batch, max_dist)
+            logging.info(
+                'iteration %d : loss : %f, loss_seg: %f, loss_seg_dice: %f, loss_consistency: %f, loss_fecl: %f, loss_uncl: %f' %
+                (iter_num, loss.item(), loss_seg.item(), loss_seg_dice.item(),
+                 consistency_loss.item(), f_loss.item(), u_loss.item()))
 
-            writer.add_scalar('train/Dice', dice_score.mean().item(), iter_num)
-            writer.add_scalar('train/HD95', hausdorff_score.mean().item(), iter_num)
-
-            # Periodic logging
-            if iter_num % 50 == 0:
-                logging.info('iteration %d : loss : %f loss_seg: %f loss_seg_dice: %f f_loss: %f u_loss: %f'
-                             % (iter_num, loss.item(), loss_seg.item(), loss_seg_dice.item(),
-                                f_loss.item(), u_loss.item()))
-
-            # Periodic validation and checkpointing
-            if iter_num > 0 and iter_num % 200 == 0:
+            # ========== Validation ========== #
+            if iter_num % 200 == 0:
                 model.eval()
-                avg_metric = []
-
+                metric_list = 0.0
                 with torch.no_grad():
                     for i_batch, sampled_batch in enumerate(db_val):
+                        metric_i = []
                         volume_batch, label_batch = sampled_batch['image'].unsqueeze(0).to(device), \
                             sampled_batch['label'].unsqueeze(0).to(device)
 
-                        # Get model predictions
-                        _, outputs = model(volume_batch)
-                        outputs_soft = F.softmax(outputs, dim=1)
-                        outputs_bin = (outputs_soft[:, 1, :, :, :] > 0.5).float()
+                        # Pad if necessary
+                        if volume_batch.shape[2] < args.patch_size[0] or \
+                                volume_batch.shape[3] < args.patch_size[1] or \
+                                volume_batch.shape[4] < args.patch_size[2]:
+                            pw = max((args.patch_size[0] - volume_batch.shape[2]) // 2 + 1, 0)
+                            ph = max((args.patch_size[1] - volume_batch.shape[3]) // 2 + 1, 0)
+                            pd = max((args.patch_size[2] - volume_batch.shape[4]) // 2 + 1, 0)
+                            volume_batch = F.pad(volume_batch, [pd, pd, ph, ph, pw, pw], mode='constant', value=0)
+                            label_batch = F.pad(label_batch, [pd, pd, ph, ph, pw, pw], mode='constant', value=0)
+
+                        outputs, _, _ = model(volume_batch)
+                        outputs_soft = torch.softmax(outputs, dim=1)
+                        outputs = torch.argmax(outputs_soft, dim=1).squeeze(0).cpu().numpy()
+                        y = label_batch.squeeze(0).squeeze(0).cpu().numpy()
 
                         # Calculate metrics
-                        dice_score = metrics.compute_dice(outputs_bin, label_batch).item()
+                        metric_i.append(metrics.dice(outputs == 1, y == 1))
+                        metric_list += np.array(metric_i)
 
-                        # For HD95, handle edge cases
-                        if outputs_bin.sum() > 0 and label_batch.sum() > 0:
-                            hd95_score = metrics.compute_hd95(outputs_bin, label_batch).item()
-                        else:
-                            hd95_score = 0.0
+                metric_list = metric_list / len(db_val)
+                for class_i in range(1):
+                    writer.add_scalar('info/val_dice_class_{}'.format(class_i + 1), metric_list[class_i], iter_num)
 
-                        avg_metric.append([dice_score, hd95_score])
+                performance = np.mean(metric_list, axis=0)
+                writer.add_scalar('info/val_dice_mean', performance, iter_num)
 
-                avg_metric = np.array(avg_metric)
-                avg_dice = np.mean(avg_metric[:, 0])
-                avg_hd95 = np.mean(avg_metric[:, 1])
-
-                writer.add_scalar('val/Dice', avg_dice, iter_num)
-                writer.add_scalar('val/HD95', avg_hd95, iter_num)
-
-                logging.info('iteration %d : mean_dice : %f mean_hd95 : %f' % (iter_num, avg_dice, avg_hd95))
-
-                if avg_dice > best_performance:
-                    best_performance = avg_dice
-                    save_mode_path = os.path.join(snapshot_path,
-                                                  'iter_{}_dice_{}.pth'.format(iter_num, round(best_performance, 4)))
-                    save_best = os.path.join(snapshot_path, '{}_best_model.pth'.format(args.model))
+                if performance > best_performance:
+                    best_performance = performance
+                    save_mode_path = os.path.join(snapshot_path, 'iter_num_{}_dice_{}.pth'.format(
+                        iter_num, round(best_performance, 4)))
+                    save_best = os.path.join(snapshot_path, 'best_model.pth')
                     torch.save(model.state_dict(), save_mode_path)
                     torch.save(model.state_dict(), save_best)
 
+                logging.info('iteration %d : mean_dice : %f' % (iter_num, performance))
                 model.train()
 
-            # Early stopping check
+            # Save every 3000 iterations
+            if iter_num % 3000 == 0:
+                save_mode_path = os.path.join(snapshot_path, 'iter_' + str(iter_num) + '.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info("save model to {}".format(save_mode_path))
+
             if iter_num >= max_iterations:
                 break
-
         if iter_num >= max_iterations:
             iterator.close()
             break
-
     writer.close()
+    logging.info("Training completed!")
