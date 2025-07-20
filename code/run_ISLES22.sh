@@ -8,7 +8,8 @@ python train_DyCON_ISLES22.py \
 --model "unet_3D" \
 --max_iterations 20000 \
 --temp 0.6 \
---batch_size 8 \
+--batch_size 2 \
+--labeled_bs 1 \
 --labelnum 10 \
 --gpu_id 0 \
 --patch_size 96 96 64

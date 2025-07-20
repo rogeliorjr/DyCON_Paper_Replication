@@ -343,7 +343,7 @@ if __name__ == "__main__":
         plt.close()
         # plt.show()
 
-    hd5_dir = "/mnt/nvme0n1/Dataset/segmentation/ISLES2022/ISLES22_database/dwi_data"
+    hd5_dir = "/home/dojo/PycharmProjects/DyCON_Paper_Replication/data/ISLES22"
     patch_size = (96, 96, 64)
     
     data = ISLESDataset(h5_dir=hd5_dir,

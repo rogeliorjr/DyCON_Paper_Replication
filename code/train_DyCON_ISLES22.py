@@ -26,7 +26,7 @@ import torchvision.transforms as T
 import torch.backends.cudnn as cudnn
 
 from dataloaders.isles22 import ISLESDataset, RandomCrop, RandomRotFlip, ToTensor, TwoStreamBatchSampler
-from networks.net_factory import net_factory_3d
+from networks.net_factory_3d import net_factory_3d
 from utils import losses, metrics, ramps
 from utils import dycon_losses
 
@@ -115,17 +115,7 @@ def update_ema_variables(model, ema_model, alpha, global_step):
     # Use the true average until the exponential average is more correct
     alpha = min(1 - 1 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-        ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
-
-
-def plot_samples(image, mask, epoch):
-    """Plot sample slices of the image/preds and mask"""
-    # image: (C, H, W, D), mask: (H, W, D)
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-    ax[0].imshow(image[1][:, :, image.shape[-1] // 2], cmap='gray')  # access the class at index 1
-    ax[1].imshow(mask[:, :, mask.shape[-1] // 2], cmap='viridis')
-    plt.savefig(f'../misc/train_preds/ISLES22_sample_slice_{str(epoch)}.png')
-    plt.close()
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
 
 def patients_to_slices(dataset_path, labelnum):
@@ -135,66 +125,68 @@ def patients_to_slices(dataset_path, labelnum):
     return labelnum
 
 
-# ========== Main Training Function ========== #
+def worker_init_fn(worker_id):
+    random.seed(args.seed + worker_id)
+
+
+# ========== Main Training ========== #
 if __name__ == "__main__":
-    # Create directories
+    # Create snapshot directory
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
     if os.path.exists(snapshot_path + '/code'):
         shutil.rmtree(snapshot_path + '/code')
-    shutil.copytree('.', snapshot_path + '/code',
-                    shutil.ignore_patterns(['.git', '__pycache__']))
+    shutil.copytree('.', snapshot_path + '/code', shutil.ignore_patterns(['.git', '__pycache__']))
 
-    # Setup logging
+    # Logging setup
     logging.basicConfig(filename=snapshot_path + "/log.txt", level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
+    # ========== Model and EMA Model Setup ========== #
+    model = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=num_classes)
+    model = model.to(device)
 
-    # ========== Model Definition ========== #
-    def create_model(ema=False):
-        net = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=num_classes, scaler=args.feature_scaler)
-        model = net.to(device)
-        if ema:
-            for param in model.parameters():
-                param.detach_()
-        return model
+    # Initialize EMA model
+    ema_model = net_factory_3d(net_type=args.model, in_chns=args.in_ch, class_num=num_classes)
+    ema_model = ema_model.to(device)
+    for param in ema_model.parameters():
+        param.detach_()
 
+    # Log model size
+    model_params = sum(p.numel() for p in model.parameters()) / 1e6
+    logging.info(f"Total params of model: {model_params:.2f}M")
 
-    model = create_model()
-    ema_model = create_model(ema=True)
-    logging.info("Total params of model: {:.2f}M".format(sum(p.numel() for p in model.parameters()) / 1e6))
-
-    # ========== Dataset Setup ========== #
+    # ========== Data Loading ========== #
+    # Create dataset
     db_train = ISLESDataset(h5_dir=args.root_dir,
                             split='train',
                             transform=T.Compose([
-                                RandomCrop(patch_size),
                                 RandomRotFlip(),
+                                RandomCrop(patch_size),
                                 ToTensor(),
                             ]))
     db_val = ISLESDataset(h5_dir=args.root_dir,
                           split='val',
-                          transform=T.Compose([ToTensor()]))
+                          transform=T.Compose([
+                              RandomCrop(patch_size),
+                              ToTensor()
+                          ]))
 
-    # Setup data sampling
-    labelnum = args.labelnum
-    labeled_slice = patients_to_slices(args.root_dir, args.labelnum)
+    # Log data splits
     total_slices = len(db_train)
-    print("Total slices is: {}, labeled slices is: {}".format(total_slices, labeled_slice))
+    labeled_slice = patients_to_slices(args.root_dir, args.labelnum)
+    logging.info(f"Total slices is: {total_slices}, labeled slices is: {labeled_slice}")
 
     labeled_idxs = list(range(0, labeled_slice))
     unlabeled_idxs = list(range(labeled_slice, total_slices))
+
     batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size - labeled_bs)
 
-
-    def worker_init_fn(worker_id):
-        random.seed(args.seed + worker_id)
-
-
-    trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=4,
-                             pin_memory=True, worker_init_fn=worker_init_fn)
+    trainloader = DataLoader(db_train, batch_sampler=batch_sampler,
+                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+    valloader = DataLoader(db_val, batch_size=1, shuffle=False, num_workers=1)
 
     model.train()
     ema_model.train()
@@ -262,9 +254,15 @@ if __name__ == "__main__":
             ema_embedding = torch.transpose(ema_embedding, 1, 2)
             ema_embedding = F.normalize(ema_embedding, dim=-1)
 
-            # Create mask for contrastive learning
-            mask_con = F.avg_pool3d(label_batch.float(), kernel_size=args.feature_scaler * 4,
-                                    stride=args.feature_scaler * 4)
+            # Create mask for contrastive learning with dynamic downsampling factor
+            # Calculate the actual downsampling factor based on feature dimensions
+            _, _, H_f, W_f, D_f = stud_features.shape
+            H_in, W_in, D_in = patch_size
+            downsample_factor = H_in // H_f  # This should give you the correct factor
+
+            # Create mask with correct downsampling
+            mask_con = F.avg_pool3d(label_batch.float(), kernel_size=downsample_factor,
+                                    stride=downsample_factor)
             mask_con = (mask_con > 0.5).float()
             mask_con = mask_con.reshape(B, -1)
             mask_con = mask_con.unsqueeze(1)
@@ -293,99 +291,73 @@ if __name__ == "__main__":
             loss.backward()
 
             # Apply gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
 
             # Update EMA model
             update_ema_variables(model, ema_model, args.ema_decay, iter_num)
 
-            iter_num = iter_num + 1
-
-            # Logging
-            writer.add_scalar('info/loss', loss, iter_num)
-            writer.add_scalar('info/f_loss', f_loss, iter_num)
-            writer.add_scalar('info/u_loss', u_loss, iter_num)
-            writer.add_scalar('info/loss_ce', loss_seg, iter_num)
-            writer.add_scalar('info/loss_dice', loss_seg_dice, iter_num)
+            # ========== Logging ========== #
+            iter_num += 1
+            writer.add_scalar('info/total_loss', loss, iter_num)
+            writer.add_scalar('info/loss_seg', loss_seg, iter_num)
+            writer.add_scalar('info/loss_seg_dice', loss_seg_dice, iter_num)
             writer.add_scalar('info/consistency_loss', consistency_loss, iter_num)
             writer.add_scalar('info/consistency_weight', consistency_weight, iter_num)
+            writer.add_scalar('info/f_loss', f_loss, iter_num)
+            writer.add_scalar('info/u_loss', u_loss, iter_num)
+            writer.add_scalar('info/beta', beta, iter_num)
 
-            # Clean up
-            del noise, stud_embedding, ema_logits, ema_features, ema_probs, mask_con
+            logging.info(f'iteration {iter_num} : loss : {loss.item():.4f}, '
+                         f'loss_seg: {loss_seg.item():.4f}, loss_seg_dice: {loss_seg_dice.item():.4f}, '
+                         f'f_loss: {f_loss.item():.4f}, u_loss: {u_loss.item():.4f}')
 
-            # Calculate training metrics
-            with torch.no_grad():
-                outputs_bin = (stud_probs[:, 1, :, :, :] > 0.5).float()
-                dice_score = metrics.compute_dice(outputs_bin, label_batch)
-                H, W, D = stud_logits.shape[-3:]
-                max_dist = np.linalg.norm([H, W, D])
-                hausdorff_score = metrics.compute_hd95(outputs_bin, label_batch, max_dist)
-
-            writer.add_scalar('train/Dice', dice_score.mean().item(), iter_num)
-            writer.add_scalar('train/HD95', hausdorff_score.mean().item(), iter_num)
-
-            # Periodic logging
-            if iter_num % 50 == 0:
-                logging.info('iteration %d : loss : %f loss_seg: %f loss_seg_dice: %f f_loss: %f u_loss: %f'
-                             % (iter_num, loss.item(), loss_seg.item(), loss_seg_dice.item(),
-                                f_loss.item(), u_loss.item()))
-
-            # Periodic validation and checkpointing
-            if iter_num > 0 and iter_num % 200 == 0:
+            # ========== Validation ========== #
+            if iter_num % 100 == 0:
                 model.eval()
-                avg_metric = []
+                metric_list = []
+                for i_batch, sampled_batch in enumerate(valloader):
+                    metric_i = metrics.test_single_volume(sampled_batch["image"], sampled_batch["label"],
+                                                          model, classes=num_classes, patch_size=patch_size)
+                    metric_list.append(metric_i)
 
-                with torch.no_grad():
-                    for i_batch, sampled_batch in enumerate(db_val):
-                        volume_batch, label_batch = sampled_batch['image'].unsqueeze(0).to(device), \
-                            sampled_batch['label'].unsqueeze(0).to(device)
+                metric_list = np.array(metric_list)  # (val_size, num_classes, 4)
+                for class_i in range(1, num_classes):
+                    writer.add_scalar(f'info/val_dice_class_{class_i}',
+                                      np.mean(metric_list[:, class_i - 1, 0]), iter_num)
+                    writer.add_scalar(f'info/val_hd95_class_{class_i}',
+                                      np.mean(metric_list[:, class_i - 1, 1]), iter_num)
+                    writer.add_scalar(f'info/val_asd_class_{class_i}',
+                                      np.mean(metric_list[:, class_i - 1, 2]), iter_num)
 
-                        outputs_val = model(volume_batch)[1]
-                        outputs_soft = torch.softmax(outputs_val, dim=1)
-                        outputs_bin = (outputs_soft[:, 1, :, :, :] > 0.5).float()
+                performance = np.mean(metric_list[:, :, 0])  # mean dice
+                mean_hd95 = np.mean(metric_list[:, :, 1])
+                mean_asd = np.mean(metric_list[:, :, 2])
 
-                        dice = metrics.compute_dice(outputs_bin.squeeze(0), label_batch.squeeze(0))
-                        avg_metric.append(dice.item())
+                writer.add_scalar('info/val_mean_dice', performance, iter_num)
+                writer.add_scalar('info/val_mean_hd95', mean_hd95, iter_num)
+                writer.add_scalar('info/val_mean_asd', mean_asd, iter_num)
 
-                avg_metric = np.mean(avg_metric)
-                writer.add_scalar('val/Dice', avg_metric, iter_num)
-                logging.info('iteration %d : validation Dice : %f' % (iter_num, avg_metric))
-
-                # Save best model
-                if avg_metric > best_performance:
-                    best_performance = avg_metric
-                    save_mode_path = os.path.join(snapshot_path, 'iter_{}_dice_{}.pth'.format(
-                        iter_num, round(best_performance, 4)))
-                    save_best = os.path.join(snapshot_path, 'best_model.pth')
-                    torch.save(model.state_dict(), save_mode_path)
+                if performance > best_performance:
+                    best_performance = performance
+                    save_best = os.path.join(snapshot_path, f'best_model.pth')
                     torch.save(model.state_dict(), save_best)
-                    logging.info("save model to {}".format(save_mode_path))
+                    logging.info(f'iteration {iter_num}, best model saved with dice: {best_performance:.4f}')
 
-                # Save sample predictions
-                if iter_num % 1000 == 0:
-                    with torch.no_grad():
-                        volume_batch, label_batch = next(iter(trainloader))['image'][:1].to(device), \
-                            next(iter(trainloader))['label'][:1].to(device)
-                        outputs = model(volume_batch)[1]
-                        outputs_soft = torch.softmax(outputs, dim=1)
-                        plot_samples(outputs_soft[0].cpu().numpy(), label_batch[0].cpu().numpy(), iter_num)
-
+                logging.info(f'iteration {iter_num} : mean_dice : {performance:.4f}, '
+                             f'mean_hd95 : {mean_hd95:.4f}, mean_asd : {mean_asd:.4f}')
                 model.train()
 
-            # Learning rate decay
-            if iter_num % 2500 == 0:
-                lr_ = base_lr * 0.1 ** (iter_num // 2500)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr_
+            # Save checkpoint
+            if iter_num % 3000 == 0:
+                save_mode_path = os.path.join(snapshot_path, f'iter_{iter_num}.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(f"save model to {save_mode_path}")
 
-            # Early stopping
             if iter_num >= max_iterations:
                 break
-
         if iter_num >= max_iterations:
             iterator.close()
             break
-
     writer.close()
-    logging.info("Training completed!")
-    logging.info("Best validation Dice: {}".format(best_performance))
+    logging.info(f"Training completed. Best performance: {best_performance:.4f}")
