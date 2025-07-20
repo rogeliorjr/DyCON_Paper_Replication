@@ -257,7 +257,7 @@ if __name__ == "__main__":
     # Increase num_workers for multi-GPU
     num_workers = min(4 * n_gpu, 8) if n_gpu > 1 else 0
     trainloader = DataLoader(db_train, batch_sampler=batch_sampler,
-                             num_workers=num_workers, pin_memory=True,
+                             num_workers=4, pin_memory=True,
                              worker_init_fn=worker_init_fn)
 
     model.train()
