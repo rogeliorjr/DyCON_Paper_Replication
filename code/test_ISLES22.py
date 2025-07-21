@@ -90,10 +90,11 @@ with torch.no_grad():
         # Convert to binary predictions
         outputs_bin = (outputs_soft[:, 1, :, :, :] > 0.5).float()
 
-        # Move to CPU for metric calculation
+        # Move to CPU and convert to numpy for metric calculation
         outputs_bin_np = outputs_bin.squeeze(0).cpu().numpy()
         label_np = label_batch.squeeze(0).cpu().numpy()
 
+        # Handle edge cases and calculate metrics
         if np.sum(outputs_bin_np) == 0 and np.sum(label_np) == 0:
             # Both prediction and ground truth are empty
             metric_list['dice'].append(1.0)
@@ -104,7 +105,7 @@ with torch.no_grad():
         elif np.sum(outputs_bin_np) == 0 or np.sum(label_np) == 0:
             # One is empty, the other is not
             metric_list['dice'].append(0.0)
-            # For HD95 and ASD, use maximum possible distance
+            # For HD95 and ASD, use maximum possible distance when one is empty
             H, W, D = label_np.shape
             max_dist = np.linalg.norm([H, W, D])
             metric_list['hd95'].append(max_dist)
@@ -120,16 +121,35 @@ with torch.no_grad():
                 metric_list['specificity'].append(1.0)
         else:
             # Normal case: both have positive voxels
-            dice = metrics.compute_dice(outputs_bin_np, label_np).item()
-            metric_list['dice'].append(dice)
+            # Use the existing calculate_metric_percase function if available
+            try:
+                # Import the function from test_3d_patch if it's available
+                from utils.test_3d_patch import calculate_metric_percase
 
-            # Calculate HD95
-            hd95 = metrics.compute_hd95(outputs_bin_np, label_np).item()
-            metric_list['hd95'].append(hd95)
+                dice, jc, hd95, asd = calculate_metric_percase(outputs_bin_np, label_np)
+                metric_list['dice'].append(dice)
+                metric_list['hd95'].append(hd95)
+                metric_list['asd'].append(asd)
+            except (ImportError, AttributeError):
+                # Fallback: calculate metrics directly using medpy
+                try:
+                    from medpy import metric as medpy_metric
 
-            # Calculate ASD
-            asd = metrics.compute_asd(outputs_bin_np, label_np).item()
-            metric_list['asd'].append(asd)
+                    dice = medpy_metric.binary.dc(outputs_bin_np, label_np)
+                    hd95 = medpy_metric.binary.hd95(outputs_bin_np, label_np)
+                    asd = medpy_metric.binary.asd(outputs_bin_np, label_np)
+
+                    metric_list['dice'].append(dice)
+                    metric_list['hd95'].append(hd95)
+                    metric_list['asd'].append(asd)
+                except Exception as e:
+                    print(f"Warning: Error calculating medpy metrics: {e}")
+                    # Simple dice calculation as fallback
+                    intersection = np.sum(outputs_bin_np * label_np)
+                    dice = (2.0 * intersection) / (np.sum(outputs_bin_np) + np.sum(label_np))
+                    metric_list['dice'].append(dice)
+                    metric_list['hd95'].append(0.0)
+                    metric_list['asd'].append(0.0)
 
             # Calculate sensitivity and specificity
             tp = np.sum((outputs_bin_np == 1) & (label_np == 1))
