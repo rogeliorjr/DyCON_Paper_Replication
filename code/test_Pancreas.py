@@ -72,8 +72,14 @@ def test_calculate_metric():
     return avg_metric
 
 if __name__ == '__main__':
+    print("Running Pancreas Test Evaluation...")
+    print("=" * 60)
     metric = test_calculate_metric()
-    print(metric)
+    print("=" * 60)
+    print("FINAL AVERAGE METRICS:")
+    print(f"{'Dice':<8} {'Jaccard':<8} {'HD95':<8} {'ASD':<8}")
+    print(f"{metric[0]:<8.5f} {metric[1]:<8.5f} {metric[2]:<8.5f} {metric[3]:<8.5f}")
+    print("=" * 60)
 
 # python test_Pancreas.py --labelnum 12
 

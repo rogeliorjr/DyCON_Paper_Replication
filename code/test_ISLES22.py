@@ -172,10 +172,12 @@ print(f"Labeled samples: {args.labelnum}")
 print(f"Number of test samples: {len(db_test)}")
 print("-" * 60)
 
+print(f"{'Metric':<12} | {'Mean':<8} | {'Std':<8}")
+print("-" * 60)
 for metric_name, values in metric_list.items():
     mean_val = np.mean(values)
     std_val = np.std(values)
-    print(f"{metric_name.upper():12s} | Mean: {mean_val:.4f} | Std: {std_val:.4f}")
+    print(f"{metric_name.upper():<12} | {mean_val:<8.4f} | {std_val:<8.4f}")
 
 print("=" * 60)
 

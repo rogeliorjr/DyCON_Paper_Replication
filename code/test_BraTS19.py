@@ -73,8 +73,14 @@ def test_calculate_metric():
     return avg_metric
 
 if __name__ == '__main__':
+    print("Running BraTS19 Test Evaluation...")
+    print("=" * 60)
     metric = test_calculate_metric()
-    print(metric)
+    print("=" * 60)
+    print("FINAL AVERAGE METRICS:")
+    print(f"{'Dice':<8} {'Jaccard':<8} {'HD95':<8} {'ASD':<8}")
+    print(f"{metric[0]:<8.5f} {metric[1]:<8.5f} {metric[2]:<8.5f} {metric[3]:<8.5f}")
+    print("=" * 60)
 
 # python test_BraTS19.py --labelnum 25
 # python test_BraTS19.py --labelnum 25 --use_focal 0 --use_teacher_loss 0 --s_beta 3.0

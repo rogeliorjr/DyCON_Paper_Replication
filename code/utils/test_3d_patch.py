@@ -79,6 +79,10 @@ def test_all_case_BraTS19(model, image_list, num_classes, patch_size=(96, 96, 64
     loader = tqdm(image_list) if not metric_detail else image_list
     total_metric = 0.0
     ith = 0
+    
+    if metric_detail:
+        print(f"{'ID':<3} | {'Dice':<8} | {'Jaccard':<8} | {'HD95':<8} | {'ASD':<8}")
+        print("-" * 45)
     for image_path in loader:
         h5f = h5py.File(image_path, 'r')
         image = h5f['image'][:]
@@ -95,7 +99,7 @@ def test_all_case_BraTS19(model, image_list, num_classes, patch_size=(96, 96, 64
             single_metric = calculate_metric_percase(prediction, label[:])
             
         if metric_detail:
-            print('%02d,\t%.5f, %.5f, %.5f, %.5f' % (ith, single_metric[0], single_metric[1], single_metric[2], single_metric[3]))
+            print(f"{ith:02d}  | {single_metric[0]:<8.5f} | {single_metric[1]:<8.5f} | {single_metric[2]:<8.5f} | {single_metric[3]:<8.5f}")
 
         total_metric += np.asarray(single_metric)
         
@@ -142,6 +146,10 @@ def test_all_case_Pancreas(model, image_list, num_classes, device, patch_size=(9
     loader = tqdm(image_list) if not metric_detail else image_list
     total_metric = 0.0
     ith = 0
+    
+    if metric_detail:
+        print(f"{'ID':<3} | {'Dice':<8} | {'Jaccard':<8} | {'HD95':<8} | {'ASD':<8}")
+        print("-" * 45)
     for image_path in loader:
         # id = image_path.split('/')[-2]
         h5f = h5py.File(image_path, 'r')
@@ -159,7 +167,7 @@ def test_all_case_Pancreas(model, image_list, num_classes, device, patch_size=(9
             single_metric = calculate_metric_percase(prediction, label[:])
             
         if metric_detail:
-            print('%02d,\t%.5f, %.5f, %.5f, %.5f' % (ith, single_metric[0], single_metric[1], single_metric[2], single_metric[3]))
+            print(f"{ith:02d}  | {single_metric[0]:<8.5f} | {single_metric[1]:<8.5f} | {single_metric[2]:<8.5f} | {single_metric[3]:<8.5f}")
 
         total_metric += np.asarray(single_metric)
         
@@ -222,7 +230,7 @@ def test_all_case_ISLES22(model, image_list, num_classes, patch_size=(96, 96, 64
             single_metric = calculate_metric_percase(prediction, label[:])
             
         if metric_detail:
-            print('%02d,\t%.5f, %.5f, %.5f, %.5f' % (ith, single_metric[0], single_metric[1], single_metric[2], single_metric[3]))
+            print(f"{ith:02d}  | {single_metric[0]:<8.5f} | {single_metric[1]:<8.5f} | {single_metric[2]:<8.5f} | {single_metric[3]:<8.5f}")
 
         total_metric += np.asarray(single_metric)
         
@@ -263,7 +271,7 @@ def test_all_case(model, image_list, num_classes, device, patch_size=(112, 112, 
             single_metric = calculate_metric_percase(prediction, label[:])
             
         if metric_detail:
-            print('%02d,\t%.5f, %.5f, %.5f, %.5f' % (ith, single_metric[0], single_metric[1], single_metric[2], single_metric[3]))
+            print(f"{ith:02d}  | {single_metric[0]:<8.5f} | {single_metric[1]:<8.5f} | {single_metric[2]:<8.5f} | {single_metric[3]:<8.5f}")
 
         total_metric += np.asarray(single_metric)
         
@@ -386,7 +394,7 @@ def test_all_case_plus(model_l, model_r, image_list, num_classes, patch_size=(11
             single_metric = calculate_metric_percase(prediction, label[:])
             
         if metric_detail:
-            print('%02d,\t%.5f, %.5f, %.5f, %.5f' % (ith, single_metric[0], single_metric[1], single_metric[2], single_metric[3]))
+            print(f"{ith:02d}  | {single_metric[0]:<8.5f} | {single_metric[1]:<8.5f} | {single_metric[2]:<8.5f} | {single_metric[3]:<8.5f}")
 
         total_metric += np.asarray(single_metric)
         
