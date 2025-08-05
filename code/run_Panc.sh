@@ -1,4 +1,4 @@
-# Description: Run the training code for DyCON-PancreasCT
+# Description: Run the training code for DyCON-PancreasCT x
 
 # Main training script
 python train_DyCON_Pancreas.py \
